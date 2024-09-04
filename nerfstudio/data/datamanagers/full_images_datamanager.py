@@ -27,7 +27,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Dict, ForwardRef, Generic, List, Literal, Optional, Tuple, Type, Union, cast, get_args, get_origin
+from typing import (Dict, ForwardRef, Generic, List, Literal, Optional, Tuple,
+                    Type, Union, cast, get_args, get_origin)
 
 import cv2
 import fpsample
@@ -37,12 +38,16 @@ from rich.progress import track
 from torch.nn import Parameter
 from typing_extensions import assert_never
 
-from nerfstudio.cameras.camera_utils import fisheye624_project, fisheye624_unproject_helper
+from nerfstudio.cameras.camera_utils import (fisheye624_project,
+                                             fisheye624_unproject_helper)
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
-from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
+from nerfstudio.data.datamanagers.base_datamanager import (DataManager,
+                                                           DataManagerConfig,
+                                                           TDataset)
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
-from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+from nerfstudio.data.dataparsers.nerfstudio_dataparser import \
+    NerfstudioDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.utils.misc import get_orig_class
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -427,6 +432,8 @@ def _undistort_image(
         newK[1, 2] -= y
         if "depth_image" in data:
             data["depth_image"] = data["depth_image"][y : y + h, x : x + w]
+        if "semantics_image" in data:
+            data["semantics_image"] = data["semantics_image"][y : y + h, x : x + w]
         if "mask" in data:
             mask = data["mask"].numpy()
             mask = mask.astype(np.uint8) * 255

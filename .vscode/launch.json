@@ -4,6 +4,7 @@
   // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
   "version": "0.2.0",
   "configurations": [
+
     {
       "name": "Launch Chrome against localhost",
       "request": "launch",
@@ -92,6 +93,26 @@
       "program": "nerfstudio/scripts/train.py",
       "console": "integratedTerminal",
       "args": ["semantic_nerf"]
+    },
+    {
+      "name": "Python: train semantic splat",
+      "type": "python",
+      "request": "launch",
+      "program": "nerfstudio/scripts/train.py",
+      "console": "integratedTerminal",
+      "args": ["semantic-splatfacto",
+      "--data",
+      "/media/stanlew/Data/narf_sapien_data/v0/transforms_0.json",
+      "--experiment_name",
+      "sapien_splat",
+      "--vis","viewer+tensorboard",
+      "--pipeline.model.use_scale_regularization",
+      "True",
+      "--pipeline.model.random_scale",
+      "1.0",
+      "--pipeline.model.num_classes",
+      "4",
+    ]
     },
     {
       "name": "Python: NeuS on Replica",

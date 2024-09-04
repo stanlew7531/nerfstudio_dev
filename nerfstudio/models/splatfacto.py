@@ -25,6 +25,8 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+import torchvision
 
 try:
     from gsplat.rendering import rasterization
@@ -34,12 +36,17 @@ from gsplat.cuda_legacy._wrapper import num_sh_bases
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import (CameraOptimizer,
+                                                  CameraOptimizerConfig)
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+from nerfstudio.engine.callbacks import (TrainingCallback,
+                                         TrainingCallbackAttributes,
+                                         TrainingCallbackLocation)
 from nerfstudio.engine.optimizers import Optimizers
-from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
+from nerfstudio.model_components.lib_bilagrid import (BilateralGrid,
+                                                      color_correct, slice,
+                                                      total_variation_loss)
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.misc import torch_compile
@@ -210,6 +217,10 @@ class SplatfactoModelConfig(ModelConfig):
     """Shape of the bilateral grid (X, Y, W)"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
+    num_classes: int = 1
+    """If using semantics, set to the number of classes. 1 induces the default behavior of no semantics."""
+    semantic_loss_mult: float = 1e-5
+    """Multiplier for the semantic loss if used during training"""
 
 
 class SplatfactoModel(Model):
@@ -265,6 +276,11 @@ class SplatfactoModel(Model):
             features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
             features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
 
+        if self.config.num_classes > 1:
+            features_semantics = torch.nn.Parameter(torch.rand(num_points, self.config.num_classes))
+        else:
+            features_semantics = None
+
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
         self.gauss_params = torch.nn.ParameterDict(
             {
@@ -274,6 +290,7 @@ class SplatfactoModel(Model):
                 "features_dc": features_dc,
                 "features_rest": features_rest,
                 "opacities": opacities,
+                "features_semantics": features_semantics,
             }
         )
 
@@ -283,7 +300,8 @@ class SplatfactoModel(Model):
 
         # metrics
         from torchmetrics.image import PeakSignalNoiseRatio
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+        from torchmetrics.image.lpip import \
+            LearnedPerceptualImagePatchSimilarity
 
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
@@ -350,6 +368,10 @@ class SplatfactoModel(Model):
     @property
     def opacities(self):
         return self.gauss_params["opacities"]
+    
+    @property
+    def features_semantics(self):
+        return self.gauss_params["features_semantics"]
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
@@ -357,7 +379,7 @@ class SplatfactoModel(Model):
         if "means" in dict:
             # For backwards compatibility, we remap the names of parameters from
             # means->gauss_params.means since old checkpoints have that format
-            for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+            for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities", "features_semantics"]:
                 dict[f"gauss_params.{p}"] = dict[p]
         newp = dict["gauss_params.means"].shape[0]
         for name, param in self.gauss_params.items():
@@ -504,9 +526,12 @@ class SplatfactoModel(Model):
                 dups &= high_grads
                 dup_params = self.dup_gaussians(dups)
                 for name, param in self.gauss_params.items():
-                    self.gauss_params[name] = torch.nn.Parameter(
-                        torch.cat([param.detach(), split_params[name], dup_params[name]], dim=0)
-                    )
+                    if param is not None:
+                        self.gauss_params[name] = torch.nn.Parameter(
+                            torch.cat([param.detach(), split_params[name], dup_params[name]], dim=0)
+                        )
+                    # else:
+                    #     self.gauss_params[name] = torch.nn.Parameter(None)
                 # append zeros to the max_2Dsize tensor
                 self.max_2Dsize = torch.cat(
                     [
@@ -585,7 +610,7 @@ class SplatfactoModel(Model):
             culls = culls | toobigs
             toobigs_count = torch.sum(toobigs).item()
         for name, param in self.gauss_params.items():
-            self.gauss_params[name] = torch.nn.Parameter(param[~culls])
+            self.gauss_params[name] = torch.nn.Parameter(param[~culls]) if param is not None else None
 
         CONSOLE.log(
             f"Culled {n_bef - self.num_points} gaussians "
@@ -619,6 +644,8 @@ class SplatfactoModel(Model):
         self.scales[split_mask] = torch.log(torch.exp(self.scales[split_mask]) / size_fac)
         # step 5, sample new quats
         new_quats = self.quats[split_mask].repeat(samps, 1)
+        # step 6, sample new semantics
+        new_semantics = self.features_semantics[split_mask].repeat(samps, 1) if self.features_semantics is not None else None
         out = {
             "means": new_means,
             "features_dc": new_features_dc,
@@ -626,6 +653,7 @@ class SplatfactoModel(Model):
             "opacities": new_opacities,
             "scales": new_scales,
             "quats": new_quats,
+            "features_semantics": new_semantics,
         }
         for name, param in self.gauss_params.items():
             if name not in out:
@@ -640,7 +668,7 @@ class SplatfactoModel(Model):
         CONSOLE.log(f"Duplicating {dup_mask.sum().item()/self.num_points} gaussians: {n_dups}/{self.num_points}")
         new_dups = {}
         for name, param in self.gauss_params.items():
-            new_dups[name] = param[dup_mask]
+            new_dups[name] = param[dup_mask] if param is not None else None # need to handle None for semantics
         return new_dups
 
     def get_training_callbacks(
@@ -673,7 +701,7 @@ class SplatfactoModel(Model):
         # specify more if they want to add more optimizable params to gaussians.
         return {
             name: [self.gauss_params[name]]
-            for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+            for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities", "features_semantics"]
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -778,6 +806,7 @@ class SplatfactoModel(Model):
             features_rest_crop = self.features_rest[crop_ids]
             scales_crop = self.scales[crop_ids]
             quats_crop = self.quats[crop_ids]
+            features_semantics_crop = self.features_semantics[crop_ids] if self.features_semantics is not None else None
         else:
             opacities_crop = self.opacities
             means_crop = self.means
@@ -785,6 +814,7 @@ class SplatfactoModel(Model):
             features_rest_crop = self.features_rest
             scales_crop = self.scales
             quats_crop = self.quats
+            features_semantics_crop = self.features_semantics
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
@@ -834,6 +864,29 @@ class SplatfactoModel(Model):
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
+        semantic_render, semantic_alpha, semantic_info = None, None, None
+        if features_semantics_crop is not None:
+            semantic_render, semantic_alpha, semantic_info = rasterization(
+                means=means_crop,
+                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=features_semantics_crop,
+                viewmats=viewmat,  # [1, 4, 4]
+                Ks=K,  # [1, 3, 3]
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode=render_mode,
+                sh_degree=None, # None induces N-D Feature rendering in gsplat (note that features_semantics must be of shape [N,D] or [C, N, D])
+                sparse_grad=False,
+                absgrad=True,
+                rasterize_mode=self.config.rasterize_mode,
+            )
+
         if self.training and info["means2d"].requires_grad:
             info["means2d"].retain_grad()
         self.xys = info["means2d"]  # [1, N, 2]
@@ -863,6 +916,7 @@ class SplatfactoModel(Model):
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
+            "semantics": semantic_render.squeeze(0) if semantic_render is not None else None, # type: ignore
         }  # type: ignore
 
     def get_gt_img(self, image: torch.Tensor):
@@ -875,6 +929,15 @@ class SplatfactoModel(Model):
             image = image.float() / 255.0
         gt_img = self._downscale_if_required(image)
         return gt_img.to(self.device)
+    
+    def get_gt_sem_img(self, image: torch.Tensor):
+        """Compute groundtruth semantic image with iteration dependent downscale factor for evaluation purpose
+        Note the difference here vs. get_gt_img is that we dont normalize the values on [0,255.] - they stay as logits
+
+        Args:
+            image: tensor.Tensor in type uint8
+        """
+        return self._downscale_if_required(image).to(self.device)
 
     def composite_with_background(self, image, background) -> torch.Tensor:
         """Composite the ground truth image with a background color when it has an alpha channel.
@@ -897,8 +960,10 @@ class SplatfactoModel(Model):
             batch: ground truth batch corresponding to outputs
         """
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        gt_semantics = self.get_gt_sem_img(batch["semantics"]) if "semantics" in batch else None
         metrics_dict = {}
         predicted_rgb = outputs["rgb"]
+        predicted_semantics = outputs["semantics"]
 
         metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
         if self.config.color_corrected_metrics:
@@ -906,6 +971,16 @@ class SplatfactoModel(Model):
             metrics_dict["cc_psnr"] = self.psnr(cc_rgb, gt_rgb)
 
         metrics_dict["gaussian_count"] = self.num_points
+
+        # compute the semantic loss metric
+        if gt_semantics is not None and predicted_semantics is not None:
+            pred_sem_view = predicted_semantics.view(-1, predicted_semantics.shape[-1])
+            gt_sem_view = gt_semantics.view(-1).long()
+
+            metrics_dict["semantic_loss"] = F.cross_entropy(\
+                pred_sem_view,\
+                gt_sem_view)
+            metrics_dict["semantic_acc"] = (pred_sem_view.argmax(dim=-1) == gt_sem_view).float().mean()
 
         self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
@@ -946,10 +1021,16 @@ class SplatfactoModel(Model):
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
 
+        
+
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
         }
+
+        # only include the semantics loss if requested
+        if(self.config.num_classes > 1):
+            loss_dict["semantic_loss"] = metrics_dict["semantic_loss"] * self.config.semantic_loss_mult
 
         if self.training:
             # Add loss from camera optimizer
@@ -987,10 +1068,36 @@ class SplatfactoModel(Model):
             A dictionary of metrics.
         """
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        gt_semantics = self.get_gt_sem_img(batch["semantics"]) if "semantics" in batch else None
         predicted_rgb = outputs["rgb"]
+        predicted_semantics = outputs["semantics"]
+
         cc_rgb = None
 
-        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1) # [H, 2W, 3]
+
+        # turn the semantics images into human visible colored images
+        if predicted_semantics is not None:
+            combined_masks = []
+            # turn predicted semantics into labels instead of logits
+            predicted_semantics = torch.argmax(predicted_semantics, dim=-1, keepdim=True)
+            # generate the list of masks from the gt and pred images
+            for i in range(self.config.num_classes):
+                gt_mask_i = gt_semantics == i # [H, W]
+                pred_mask_i = predicted_semantics == i # [H, W]
+                combined_masks_i = torch.cat([gt_mask_i, pred_mask_i], dim=1) # [H, 2W]
+                combined_masks.append(combined_masks_i)
+            # stack all the masks into a single tensor
+            combined_segmentation = torch.stack(combined_masks, dim=0).squeeze() # [C, H, 2W]
+            # switch from [H, W, C] to [C, H, W] for torchvision draw
+            combined_rgb_draw = torch.moveaxis(combined_rgb, -1, 0)
+            combined_segmentation = torchvision.utils.draw_segmentation_masks(
+                image=combined_rgb_draw,
+                masks=combined_segmentation,
+                alpha=0.75
+            )
+            # switch back to [H, W, C] for emission to tensorboard
+            combined_segmentation = torch.moveaxis(combined_segmentation, 0, -1)
 
         if self.config.color_corrected_metrics:
             cc_rgb = color_correct(predicted_rgb, gt_rgb)
@@ -1018,5 +1125,7 @@ class SplatfactoModel(Model):
             metrics_dict["cc_lpips"] = float(cc_lpips)
 
         images_dict = {"img": combined_rgb}
+        if predicted_semantics is not None:
+            images_dict["segmentation"] = combined_segmentation
 
         return metrics_dict, images_dict

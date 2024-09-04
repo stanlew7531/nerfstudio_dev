@@ -24,15 +24,16 @@ import torch
 from PIL import Image
 
 from nerfstudio.cameras import camera_utils
-from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
-from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
+from nerfstudio.cameras.cameras import (CAMERA_MODEL_TO_TYPE, Cameras,
+                                        CameraType)
+from nerfstudio.data.dataparsers.base_dataparser import (DataParser,
+                                                         DataParserConfig,
+                                                         DataparserOutputs,
+                                                         Semantics)
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import (
-    get_train_eval_split_all,
-    get_train_eval_split_filename,
-    get_train_eval_split_fraction,
-    get_train_eval_split_interval,
-)
+    get_train_eval_split_all, get_train_eval_split_filename,
+    get_train_eval_split_fraction, get_train_eval_split_interval)
 from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -99,6 +100,8 @@ class Nerfstudio(DataParser):
         image_filenames = []
         mask_filenames = []
         depth_filenames = []
+        semantics_filenames = []
+
         poses = []
 
         fx_fixed = "fl_x" in meta
@@ -182,6 +185,15 @@ class Nerfstudio(DataParser):
                 depth_fname = self._get_fname(depth_filepath, data_dir, downsample_folder_prefix="depths_")
                 depth_filenames.append(depth_fname)
 
+            if "semantics_path" in frame:
+                semantics_filepath = Path(frame["semantics_path"])
+                semantics_fname = self._get_fname(
+                    semantics_filepath,
+                    data_dir,
+                    downsample_folder_prefix="semantics_",
+                )
+                semantics_filenames.append(semantics_fname)
+
         assert len(mask_filenames) == 0 or (len(mask_filenames) == len(image_filenames)), """
         Different number of image and mask filenames.
         You should check that mask_path is specified for every frame (or zero frames) in transforms.json.
@@ -252,6 +264,7 @@ class Nerfstudio(DataParser):
         image_filenames = [image_filenames[i] for i in indices]
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
         depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
+        semantics_filenames = [semantics_filenames[i] for i in indices] if len(semantics_filenames) > 0 else []
 
         idx_tensor = torch.tensor(indices, dtype=torch.long)
         poses = poses[idx_tensor]
@@ -365,7 +378,8 @@ class Nerfstudio(DataParser):
                 if self.create_pc:
                     import json
 
-                    from nerfstudio.process_data.colmap_utils import create_ply_from_colmap
+                    from nerfstudio.process_data.colmap_utils import \
+                        create_ply_from_colmap
 
                     with open(self.config.data / "transforms.json") as f:
                         transforms = json.load(f)
@@ -414,10 +428,23 @@ class Nerfstudio(DataParser):
                 "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
                 "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
                 "mask_color": self.config.mask_color,
+                "semantics_filenames": semantics_filenames if len(semantics_filenames) > 0 else None,
+                "semantics": self._create_semantics(semantics_filenames) if len(semantics_filenames) > 0 else None,
                 **metadata,
             },
         )
         return dataparser_outputs
+    
+    # this method is only included to allow for using the Semantic Dataset
+    # without also breaking the base nerfacto dataset (e.g. no semantics) use case
+    def _create_semantics(self, semantics_fnames: list[Path]) -> Semantics:
+        to_return = Semantics(
+            filenames=semantics_fnames,
+            classes=[],
+            colors=torch.tensor([]),
+            mask_classes=[],
+        )
+        return to_return
 
     def _load_3D_points(self, ply_file_path: Path, transform_matrix: torch.Tensor, scale_factor: float):
         """Loads point clouds positions and colors from .ply
