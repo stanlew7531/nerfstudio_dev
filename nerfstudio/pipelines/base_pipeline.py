@@ -23,20 +23,24 @@ from abc import abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
-from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Union, cast
+from typing import (Any, Dict, List, Literal, Mapping, Optional, Tuple, Type,
+                    Union, cast)
 
 import torch
 import torch.distributed as dist
 import torchvision.utils as vutils
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
+                           TimeElapsedColumn)
 from torch import nn
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn import Parameter
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nerfstudio.configs.base_config import InstantiateConfig
-from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
+from nerfstudio.data.datamanagers.base_datamanager import (DataManager,
+                                                           DataManagerConfig)
+from nerfstudio.engine.callbacks import (TrainingCallback,
+                                         TrainingCallbackAttributes)
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import profiler
 
@@ -337,7 +341,12 @@ class VanillaPipeline(Pipeline):
         self.eval()
         camera, batch = self.datamanager.next_eval_image(step)
         outputs = self.model.get_outputs_for_camera(camera)
-        metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+        # metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+        try:
+            metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+        except Exception:
+            self.model.eval()  # The code fails here due to model.training == True for some reason.
+            metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
         assert "num_rays" not in metrics_dict
         metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
         self.train()
@@ -384,7 +393,12 @@ class VanillaPipeline(Pipeline):
                 outputs = self.model.get_outputs_for_camera(camera=camera)
                 height, width = camera.height, camera.width
                 num_rays = height * width
-                metrics_dict, image_dict = self.model.get_image_metrics_and_images(outputs, batch)
+                # metrics_dict, image_dict = self.model.get_image_metrics_and_images(outputs, batch)
+                try:
+                    metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+                except Exception:
+                    self.model.eval()  # The code fails here due to model.training == True for some reason.
+                    metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
                 if output_path is not None:
                     for key in image_dict.keys():
                         image = image_dict[key]  # [H, W, C] order

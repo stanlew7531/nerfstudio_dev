@@ -219,8 +219,10 @@ class SplatfactoModelConfig(ModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
     num_classes: int = 1
     """If using semantics, set to the number of classes. 1 induces the default behavior of no semantics."""
-    semantic_loss_mult: float = 1e-5
+    semantic_loss_mult: float = 1e-7
     """Multiplier for the semantic loss if used during training"""
+    accumulation_loss_mult: float = 1e-2
+    """Multiplier for the accumulation loss if used during training"""
 
 
 class SplatfactoModel(Model):
@@ -282,17 +284,29 @@ class SplatfactoModel(Model):
             features_semantics = None
 
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
-        self.gauss_params = torch.nn.ParameterDict(
-            {
-                "means": means,
-                "scales": scales,
-                "quats": quats,
-                "features_dc": features_dc,
-                "features_rest": features_rest,
-                "opacities": opacities,
-                "features_semantics": features_semantics,
-            }
-        )
+        if self.config.num_classes > 1:
+            self.gauss_params = torch.nn.ParameterDict(
+                {
+                    "means": means,
+                    "scales": scales,
+                    "quats": quats,
+                    "features_dc": features_dc,
+                    "features_rest": features_rest,
+                    "opacities": opacities,
+                    "features_semantics": features_semantics,
+                }
+            )
+        else:
+            self.gauss_params = torch.nn.ParameterDict(
+                {
+                    "means": means,
+                    "scales": scales,
+                    "quats": quats,
+                    "features_dc": features_dc,
+                    "features_rest": features_rest,
+                    "opacities": opacities,
+                }
+            )
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -371,7 +385,7 @@ class SplatfactoModel(Model):
     
     @property
     def features_semantics(self):
-        return self.gauss_params["features_semantics"]
+        return self.gauss_params["features_semantics"] if self.config.num_classes > 1 else None
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
@@ -644,17 +658,19 @@ class SplatfactoModel(Model):
         self.scales[split_mask] = torch.log(torch.exp(self.scales[split_mask]) / size_fac)
         # step 5, sample new quats
         new_quats = self.quats[split_mask].repeat(samps, 1)
-        # step 6, sample new semantics
-        new_semantics = self.features_semantics[split_mask].repeat(samps, 1) if self.features_semantics is not None else None
         out = {
-            "means": new_means,
-            "features_dc": new_features_dc,
-            "features_rest": new_features_rest,
-            "opacities": new_opacities,
-            "scales": new_scales,
-            "quats": new_quats,
-            "features_semantics": new_semantics,
-        }
+                "means": new_means,
+                "features_dc": new_features_dc,
+                "features_rest": new_features_rest,
+                "opacities": new_opacities,
+                "scales": new_scales,
+                "quats": new_quats,
+            }
+        if(self.config.num_classes > 1):
+            # step 6, sample new semantics
+            new_semantics = self.features_semantics[split_mask].repeat(samps, 1) if self.features_semantics is not None else None
+            out["features_semantics"] = new_semantics
+
         for name, param in self.gauss_params.items():
             if name not in out:
                 out[name] = param[split_mask].repeat(samps, 1)
@@ -699,9 +715,12 @@ class SplatfactoModel(Model):
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
+        names = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        if self.config.num_classes > 1:
+            names.append("features_semantics")
         return {
             name: [self.gauss_params[name]]
-            for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities", "features_semantics"]
+            for name in names
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -972,12 +991,18 @@ class SplatfactoModel(Model):
 
         metrics_dict["gaussian_count"] = self.num_points
 
+        Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()
+        metrics_dict["l1"] = Ll1
+        simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])
+        metrics_dict["ssim"] = simloss
+
+
         # compute the semantic loss metric
         if gt_semantics is not None and predicted_semantics is not None:
             pred_sem_view = predicted_semantics.view(-1, predicted_semantics.shape[-1])
             gt_sem_view = gt_semantics.view(-1).long()
 
-            metrics_dict["semantic_loss"] = F.cross_entropy(\
+            metrics_dict["semantic_CE"] = F.cross_entropy(\
                 pred_sem_view,\
                 gt_sem_view)
             metrics_dict["semantic_acc"] = (pred_sem_view.argmax(dim=-1) == gt_sem_view).float().mean()
@@ -994,7 +1019,15 @@ class SplatfactoModel(Model):
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        # print(self.get_gt_img(batch["image"]).shape)
         pred_img = outputs["rgb"]
+        gt_accumulation = self.get_gt_img(batch["image"])
+        if(gt_accumulation.shape[-1] == 4):
+            gt_accumulation = gt_accumulation[..., -1].unsqueeze(-1) # get the alpha channel
+        else:
+            gt_accumulation = torch.ones_like(gt_img[..., :1]) # if no alpha channel, assume full opacity
+            
+        pred_accumulation = outputs["accumulation"]
 
         # Set masked part of both ground-truth and rendered image to black.
         # This is a little bit sketchy for the SSIM loss.
@@ -1021,16 +1054,20 @@ class SplatfactoModel(Model):
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
 
-        
+        # Ll2 = (gt_img -  pred_img).pow(2).mean()
+
+        acc_loss = torch.abs(gt_accumulation - pred_accumulation).mean()  * self.config.semantic_loss_mult
 
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            # "main_loss": (1 - self.config.ssim_lambda) * Ll2 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
+            "acc_loss": acc_loss,
         }
 
         # only include the semantics loss if requested
         if(self.config.num_classes > 1):
-            loss_dict["semantic_loss"] = metrics_dict["semantic_loss"] * self.config.semantic_loss_mult
+            loss_dict["semantic_loss"] = metrics_dict["semantic_CE"] * self.config.semantic_loss_mult
 
         if self.training:
             # Add loss from camera optimizer
@@ -1092,10 +1129,10 @@ class SplatfactoModel(Model):
             # switch from [H, W, C] to [C, H, W] for torchvision draw
             combined_rgb_draw = torch.moveaxis(combined_rgb, -1, 0)
             combined_segmentation = torchvision.utils.draw_segmentation_masks(
-                image=combined_rgb_draw,
+                image=(combined_rgb_draw * 255.0).to(dtype=torch.uint8),
                 masks=combined_segmentation,
                 alpha=0.75
-            )
+            ).to(dtype=torch.float32) / 255.0
             # switch back to [H, W, C] for emission to tensorboard
             combined_segmentation = torch.moveaxis(combined_segmentation, 0, -1)
 
